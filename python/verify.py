@@ -32,10 +32,9 @@ def check(name: str, ok: bool, detail: str) -> None:
 
 
 def random_scene(gen: torch.Generator, n_active: int = 40) -> torch.Tensor:
-    raw = torch.randn(1, N_SLOTS, 7, generator=gen) * 0.5
-    raw[..., 6] = -6.0
+    raw = torch.randn(1, N_SLOTS, 6, generator=gen) * 0.5
+    raw[..., 5] = 0.0
     idx = torch.randperm(N_SLOTS, generator=gen)[:n_active]
-    raw[0, idx, 6] = 3.0
     raw[0, idx, 5] = torch.randn(n_active, generator=gen) * 1.5
     return activate_gaussians(raw)
 
@@ -46,7 +45,7 @@ def test_renderer_vjp() -> None:
     cot = torch.randn(1, 70, 70, generator=gen).double()
     field = render_residual(params)
     (g,) = torch.autograd.grad((field * cot).sum(), params)
-    direction = torch.randn_like(params) * torch.tensor([0.3, 0.3, 0.1, 0.1, 0.1, 0.1, 0.05]).double()
+    direction = torch.randn_like(params) * torch.tensor([0.3, 0.3, 0.1, 0.1, 0.1, 0.1]).double()
     eps = 1e-4
     with torch.no_grad():
         fp = (render_residual(params + eps * direction) * cot).sum()
@@ -66,7 +65,7 @@ def test_adjoint_through_renderer(device: torch.device) -> None:
     field = base + render_residual(init_params)
     losses, grads = physics.loss_and_grad(field.detach().numpy(), observed)
     (g,) = torch.autograd.grad((field * torch.from_numpy(grads)).sum(), init_params)
-    direction = torch.randn_like(init_params) * torch.tensor([0.3, 0.3, 0.1, 0.1, 0.1, 0.1, 0.05])
+    direction = torch.randn_like(init_params) * torch.tensor([0.3, 0.3, 0.1, 0.1, 0.1, 0.1])
     eps = 0.02
     with torch.no_grad():
         lp, _ = physics.loss_and_grad((base + render_residual(init_params + eps * direction)).numpy(), observed)
@@ -97,7 +96,7 @@ def test_model(device: torch.device) -> None:
     pred2 = model(traces[:, :, ::8].index_select(1, keep), torch.from_numpy(source_positions_m(5)).to(device).index_select(0, keep))
     check("forward 2 shots at 4 ms", tuple(pred2.field_km.shape) == (2, 70, 70), f"dense mean={pred2.dense_km.mean():.3f} km/s")
     t0 = time.perf_counter()
-    loss = pred.field_km.abs().mean() + pred.gaussians[..., 6].mean()
+    loss = pred.field_km.abs().mean() + pred.gaussians[..., 5].abs().mean()
     loss.backward()
     if device.type != "cpu":
         torch.mps.synchronize() if device.type == "mps" else torch.cuda.synchronize()

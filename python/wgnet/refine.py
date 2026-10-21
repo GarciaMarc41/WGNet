@@ -15,11 +15,11 @@ import torch
 import torch.nn.functional as F
 
 from .physics import WavePhysics
-from .render import GRID, clamp_gaussians, render_residual
+from .render import ACTIVE_AMP_KM, GRID, clamp_gaussians, render_residual
 
 COARSE = 9
 COARSE_MAX_KM = 1.0
-GAUSS_SCALES = (1.0, 1.0, 0.2, 0.2, 0.2, 0.1, 0.1)
+GAUSS_SCALES = (1.0, 1.0, 0.2, 0.2, 0.2, 0.1)
 COARSE_SCALE = 0.1
 LBFGS_PAIRS = 8
 LINE_SEARCH_TRIALS = 6
@@ -34,7 +34,7 @@ class RefineResult(NamedTuple):
     solves: int
     seconds: float
     history: list[dict]
-    gaussians: np.ndarray  # [K, 7] refined active slots
+    gaussians: np.ndarray  # [K, 6] refined active slots
     coarse_km: np.ndarray  # [9, 9]
 
 
@@ -60,12 +60,12 @@ def refine(
     physics: WavePhysics,
     budget_solves: int = 160,
     bands_hz: Sequence[float | None] = (8.0, 12.0, None),
-    alpha_keep: float = 0.05,
+    amp_keep_km: float = ACTIVE_AMP_KM,
     device: torch.device | str = "cpu",
 ) -> RefineResult:
-    """Refine one prediction. `dense_km [70, 70]`, `gaussians [1225, 7]` activated, `observed_full [shots, nt, 70]`."""
+    """Refine one prediction. `dense_km [70, 70]`, `gaussians [1225, 6]` activated, `observed_full [shots, nt, 70]`."""
     t0 = time.perf_counter()
-    active = np.flatnonzero(gaussians[:, 6] >= alpha_keep)
+    active = np.flatnonzero(np.abs(gaussians[:, 5]) >= amp_keep_km)
     n_g = len(active)
     g0 = gaussians[active].astype(np.float64)
     dense_t = torch.from_numpy(dense_km).to(device)
@@ -76,14 +76,14 @@ def refine(
     def project(vec: np.ndarray) -> np.ndarray:
         out = vec.copy()
         out[: COARSE * COARSE] = np.clip(out[: COARSE * COARSE], -COARSE_MAX_KM, COARSE_MAX_KM)
-        g = torch.from_numpy(out[COARSE * COARSE :].reshape(n_g, 7))
+        g = torch.from_numpy(out[COARSE * COARSE :].reshape(n_g, 6))
         out[COARSE * COARSE :] = clamp_gaussians(g).numpy().reshape(-1)
         return out
 
     def assemble(vec: np.ndarray, need_grad: bool):
         coarse = torch.tensor(vec[: COARSE * COARSE].reshape(1, 1, COARSE, COARSE), dtype=torch.float32, device=device, requires_grad=need_grad)
-        full = torch.zeros(1, gaussians.shape[0], 7, device=device)
-        g = torch.tensor(vec[COARSE * COARSE :].reshape(n_g, 7), dtype=torch.float32, device=device, requires_grad=need_grad)
+        full = torch.zeros(1, gaussians.shape[0], 6, device=device)
+        g = torch.tensor(vec[COARSE * COARSE :].reshape(n_g, 6), dtype=torch.float32, device=device, requires_grad=need_grad)
         if n_g:
             full = full.index_copy(1, torch.as_tensor(active, device=device), g.unsqueeze(0))
         field = dense_t + F.interpolate(coarse, size=(GRID, GRID), mode="bilinear", align_corners=True)[0, 0] + render_residual(full)[0]
@@ -164,6 +164,6 @@ def refine(
         solves=solves,
         seconds=time.perf_counter() - t0,
         history=history,
-        gaussians=x[COARSE * COARSE :].reshape(n_g, 7).astype(np.float32),
+        gaussians=x[COARSE * COARSE :].reshape(n_g, 6).astype(np.float32),
         coarse_km=x[: COARSE * COARSE].reshape(COARSE, COARSE).astype(np.float32),
     )

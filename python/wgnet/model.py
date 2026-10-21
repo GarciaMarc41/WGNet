@@ -9,7 +9,8 @@ Pipeline for a survey of S shots (any S, any source positions):
       -> 35x35 depth queries cross-attend to all S*63*35 tokens; the first M heads carry a fixed
          traveltime bias -((t_token - tau(query, source, receiver; v_m))^2) for M trial RMS velocities
       -> feature map [B, d, 35, 35]
-      -> dense head (70x70 velocity around the training mean) + Gaussian residual head (1225 slots)
+      -> dense head (70x70 velocity around the training mean) + Gaussian residual head (1225 slots,
+         amplitude doubles as existence)
       -> field = dense + render(gaussians)
 """
 
@@ -24,7 +25,7 @@ import torch.nn.functional as F
 
 from torch.utils.checkpoint import checkpoint
 
-from .render import GRID, N_SLOTS, SLOT_SIDE, activate_gaussians, render_residual
+from .render import GRID, N_GAUSS_PARAMS, N_SLOTS, SLOT_SIDE, activate_gaussians, render_residual
 
 H_M = 10.0
 XMAX_M = (GRID - 1) * H_M        # 690 m
@@ -57,7 +58,7 @@ class Prediction(NamedTuple):
     field_km: torch.Tensor       # [B, 70, 70] dense + Gaussian residual
     dense_km: torch.Tensor       # [B, 70, 70] dense head alone
     residual_km: torch.Tensor    # [B, 70, 70] rendered Gaussian residual
-    gaussians: torch.Tensor      # [B, 1225, 7] activated slot parameters
+    gaussians: torch.Tensor      # [B, 1225, 6] activated slot parameters
     feat35: torch.Tensor         # [B, d, 35, 35] decoder features
 
 
@@ -228,13 +229,11 @@ class WGNet(nn.Module):
         self.up35 = nn.Sequential(nn.Conv2d(d, hc, 1), ConvBlock(hc), ConvBlock(hc))
         self.up70 = nn.Sequential(nn.Conv2d(hc, hc // 2, 3, padding=1), nn.SiLU(), ConvBlock(hc // 2))
         self.dense_head = nn.Conv2d(hc // 2, 1, 3, padding=1)
-        self.gauss_head = nn.Sequential(nn.Conv2d(d, hc, 1), nn.SiLU(), nn.Conv2d(hc, 7, 1))
+        self.gauss_head = nn.Sequential(nn.Conv2d(d, hc, 1), nn.SiLU(), nn.Conv2d(hc, N_GAUSS_PARAMS, 1))
         nn.init.normal_(self.dense_head.weight, std=1e-3)
         nn.init.zeros_(self.dense_head.bias)
         nn.init.normal_(self.gauss_head[-1].weight, std=1e-3)
-        with torch.no_grad():
-            self.gauss_head[-1].bias.zero_()
-            self.gauss_head[-1].bias[6] = -3.0  # slots start mostly inactive (alpha ~ 0.05)
+        nn.init.zeros_(self.gauss_head[-1].bias)
 
     # ------------------------------------------------------------------------------------------
     def preprocess(self, traces: torch.Tensor) -> torch.Tensor:
@@ -301,7 +300,7 @@ class WGNet(nn.Module):
         dense = 3.0 + 2.0 * torch.tanh(self.dense_head(h) + self.base_atanh)
         dense = dense.squeeze(1)
 
-        raw = self.gauss_head(feat35).flatten(2).transpose(1, 2)  # [B, 1225, 7]
+        raw = self.gauss_head(feat35).flatten(2).transpose(1, 2)  # [B, 1225, 6]
         gaussians = activate_gaussians(raw)
         residual = render_residual(gaussians)
         return Prediction(dense + residual, dense, residual, gaussians, feat35)

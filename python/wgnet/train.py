@@ -1,7 +1,7 @@
 """Train and evaluate WGNet.
 
 Stage `sup`  : supervised training on simulated gathers (L1 + edge L1 on the composed field, L1 on the
-               dense head alone, L1 sparsity on Gaussian existence).
+               dense head alone, L1 sparsity on Gaussian amplitudes).
 Stage `phys` : fine-tuning from a `sup` checkpoint with the exact wave-equation adjoint added, gradient
                balanced against the supervised gradient and run through a low-to-full passband schedule.
 
@@ -25,7 +25,7 @@ import torch.nn.functional as F
 from .data import SHOTS, OpenFWIData, source_positions_m
 from .model import WGNet, WGNetConfig
 from .physics import WavePhysics
-from .render import field_metrics
+from .render import ACTIVE_AMP_KM, field_metrics
 
 SHOT_SUBSETS = {5: (0, 1, 2, 3, 4), 3: (0, 2, 4), 2: (0, 4), 1: (2,)}
 
@@ -76,7 +76,7 @@ def augment(traces: torch.Tensor, rms_scale: float, rng: np.random.Generator) ->
     return traces, src
 
 
-ALPHA_FREE = 0.01  # existence below this is not penalized, so gate logits never saturate into a dead state
+AMP_FREE_KM = 0.02  # |amp| below this is not penalized, so pruned slots keep a live gradient
 
 
 def supervised_loss(pred, target: torch.Tensor, args, sparsity_weight: float) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
@@ -84,10 +84,11 @@ def supervised_loss(pred, target: torch.Tensor, args, sparsity_weight: float) ->
     l1 = err.abs().mean()
     edge = 0.5 * ((err[:, :, 1:] - err[:, :, :-1]).abs().mean() + (err[:, 1:, :] - err[:, :-1, :]).abs().mean())
     dense = (pred.dense_km - target).abs().mean()
-    alpha = pred.gaussians[..., 6]
-    sparsity = F.relu(alpha - ALPHA_FREE).mean()
+    amp = pred.gaussians[..., 5].abs()
+    sparsity = F.relu(amp - AMP_FREE_KM).mean()
     total = l1 + args.edge_weight * edge + args.dense_weight * dense + sparsity_weight * sparsity
-    return total, {"l1": l1.detach(), "edge": edge.detach(), "dense_l1": dense.detach(), "alpha_mean": alpha.detach().mean()}
+    active = (amp.detach() >= ACTIVE_AMP_KM).float().sum(dim=1).mean()
+    return total, {"l1": l1.detach(), "edge": edge.detach(), "dense_l1": dense.detach(), "active": active}
 
 
 def sparsity_weight_at(step: int, args) -> float:
@@ -112,7 +113,7 @@ def evaluate(model: torch.nn.Module, waves: np.memmap, fields_km: np.ndarray, fa
         m["dense_mae_mps"] = (pred.dense_km.float() - v).abs().mean(dim=(1, 2)) * 1000.0
         for k, val in m.items():
             acc.setdefault(k, []).append(val.cpu())
-        n_active.append((pred.gaussians[..., 6] >= 0.05).sum(dim=1).float().cpu())
+        n_active.append((pred.gaussians[..., 5].abs() >= ACTIVE_AMP_KM).sum(dim=1).float().cpu())
     per_sample = {k: torch.cat(v) for k, v in acc.items()}
     n_active_t = torch.cat(n_active)
     out = {k: float(v.mean()) for k, v in per_sample.items()}

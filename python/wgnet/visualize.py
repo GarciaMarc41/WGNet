@@ -16,7 +16,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from .data import OpenFWIData, source_positions_m
-from .render import field_metrics
+from .render import ACTIVE_AMP_KM, field_metrics
 from .train import build_model, get_device, load_checkpoint
 
 
@@ -34,7 +34,7 @@ def predict(model, waves, fields, device, batch: int = 16):
 def draw_rows(axes_rows, truth, pred, dense, resid, gauss, metrics, titles_prefix=""):
     for r, ax_row in enumerate(axes_rows):
         vmin, vmax = float(truth[r].min()), float(truth[r].max())
-        n_act = int((gauss[r, :, 6] >= 0.05).sum())
+        n_act = int((gauss[r, :, 5].abs() >= ACTIVE_AMP_KM).sum())
         panels = [
             (truth[r], "viridis", vmin, vmax, f"{titles_prefix}truth"),
             (pred[r], "viridis", vmin, vmax, f"pred  MAE={metrics['mae_mps'][r]:.0f} RMSE={metrics['rmse_mps'][r]:.0f} m/s"),

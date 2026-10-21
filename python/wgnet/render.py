@@ -1,12 +1,13 @@
 """Local-window additive Gaussian renderer on a fixed anchor lattice, plus SSIM and field metrics.
 
 Gaussian layout: one slot per 2x2-pixel cell of the 70x70 grid (35x35 = 1225 slots). Each slot owns
-7 activated parameters `(dx, dz, log_sx, log_sz, angle, amp, alpha)`:
+6 activated parameters `(dx, dz, log_sx, log_sz, angle, amp)`:
     dx, dz      offset from the slot anchor in pixels, bounded to +-OFFSET_MAX
     log_sx/sz   log standard deviations in pixels, sigma in [SIGMA_MIN, SIGMA_MAX]
     angle       rotation in radians
-    amp         residual velocity in km/s added on top of the dense prediction
-    alpha       existence weight in [0, 1]
+    amp         residual velocity in km/s added on top of the dense prediction; |amp| is the slot's
+                existence (a slot is active when |amp| >= ACTIVE_AMP_KM), so there is no separate gate
+                whose gradient would vanish together with the amplitude
 A slot only touches the (2 * WINDOW + 1)^2 pixels around its anchor, so rendering costs
 O(slots * window) instead of O(slots * pixels), and the result is a plain `index_add_`.
 """
@@ -25,7 +26,8 @@ OFFSET_MAX = 2.0
 SIGMA_MIN = 0.5
 SIGMA_MAX = 6.0
 AMP_MAX = 1.0
-N_GAUSS_PARAMS = 7
+ACTIVE_AMP_KM = 0.05
+N_GAUSS_PARAMS = 6
 V_MIN_KM, V_MAX_KM = 1.5, 4.5  # OpenFWI normalization range used for SSIM and normalized metrics
 
 
@@ -60,7 +62,7 @@ def slot_windows(device: torch.device | str = "cpu") -> tuple[torch.Tensor, torc
 
 
 def activate_gaussians(raw: torch.Tensor) -> torch.Tensor:
-    """Map unconstrained network outputs `[..., 7]` to bounded physical Gaussian parameters."""
+    """Map unconstrained network outputs `[..., 6]` to bounded physical Gaussian parameters."""
     dx = OFFSET_MAX * torch.tanh(raw[..., 0])
     dz = OFFSET_MAX * torch.tanh(raw[..., 1])
     log_range = math.log(SIGMA_MAX) - math.log(SIGMA_MIN)
@@ -68,8 +70,7 @@ def activate_gaussians(raw: torch.Tensor) -> torch.Tensor:
     log_sz = math.log(SIGMA_MIN) + log_range * torch.sigmoid(raw[..., 3])
     angle = (math.pi / 2.0) * torch.tanh(raw[..., 4])
     amp = AMP_MAX * torch.tanh(raw[..., 5])
-    alpha = torch.sigmoid(raw[..., 6])
-    return torch.stack([dx, dz, log_sx, log_sz, angle, amp, alpha], dim=-1)
+    return torch.stack([dx, dz, log_sx, log_sz, angle, amp], dim=-1)
 
 
 def clamp_gaussians(params: torch.Tensor) -> torch.Tensor:
@@ -79,12 +80,11 @@ def clamp_gaussians(params: torch.Tensor) -> torch.Tensor:
     out[..., 2:4] = out[..., 2:4].clamp(math.log(SIGMA_MIN), math.log(SIGMA_MAX))
     out[..., 4] = out[..., 4].clamp(-math.pi / 2.0, math.pi / 2.0)
     out[..., 5] = out[..., 5].clamp(-AMP_MAX, AMP_MAX)
-    out[..., 6] = out[..., 6].clamp(0.0, 1.0)
     return out
 
 
 def render_residual(params: torch.Tensor) -> torch.Tensor:
-    """Render activated slot parameters `[B, N_SLOTS, 7]` to a residual field `[B, GRID, GRID]` in km/s."""
+    """Render activated slot parameters `[B, N_SLOTS, 6]` to a residual field `[B, GRID, GRID]` in km/s."""
     bsz = params.shape[0]
     device = params.device
     flat, centers, valid = slot_windows(device)
@@ -96,7 +96,7 @@ def render_residual(params: torch.Tensor) -> torch.Tensor:
     inv_sz = torch.exp(-params[:, :, 3]).unsqueeze(-1)
     cos_a = torch.cos(params[:, :, 4]).unsqueeze(-1)
     sin_a = torch.sin(params[:, :, 4]).unsqueeze(-1)
-    weight = (params[:, :, 5] * params[:, :, 6]).unsqueeze(-1)  # amp * alpha
+    weight = params[:, :, 5].unsqueeze(-1)
 
     dx = centers[None, :, :, 0] - cx  # [B, N_SLOTS, W^2]
     dz = centers[None, :, :, 1] - cz
