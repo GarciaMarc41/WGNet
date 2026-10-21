@@ -1,0 +1,9 @@
+[package]
+name = "geology-core"
+version = "0.2.0"
+edition = "2021"
+description = "OpenFWI 70x70 geology decomposition, split hashing, Ricker wavelets, C-PML profiles, and trace noise in Rust/WASM"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]

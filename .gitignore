@@ -1,0 +1,28 @@
+# OS & editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Legacy code (per request)
+legacy_code/
+
+# Build artifacts
+target/
+dist/
+node_modules/
+.node_modules-*
+.backups/
+
+# Python virtual environment and bytecode
+.venv/
+python/.venv/
+**/__pycache__/
+*.pyc
+*.egg-info/
+*.whl
+
+# Large data and model checkpoints
+data/
+results/**/*.pt
+results/*.pt

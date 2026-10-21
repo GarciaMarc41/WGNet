@@ -1,0 +1,26 @@
+[package]
+name = "wave-gauss-rs"
+version = "0.1.0"
+edition = "2021"
+description = "Native Rust + wgpu + Rayon wave forward/adjoint solver and batched Delaunay Gaussian geometry for PyTorch"
+license = "MIT"
+
+[lib]
+name = "wave_gauss_rs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+geology-core = { path = "../geology-core" }
+pyo3 = { version = "0.23", features = ["abi3-py310"] }
+numpy = "0.23"
+rayon = "1.10"
+delaunator = "1.0"
+wgpu = "24.0"
+pollster = "0.4"
+bytemuck = { version = "1.21", features = ["derive"] }
+
+[features]
+extension-module = ["pyo3/extension-module"]
+
+[package.metadata.maturin]
+features = ["extension-module"]
