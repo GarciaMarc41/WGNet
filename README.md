@@ -1,4 +1,4 @@
-# Gaussian-Lab: Native Rust (`wgpu` + `rayon`) + PyTorch Staged Wave-to-Gaussian Inversion
+# WGNet: Physics-Guided Staged Wave-to-Gaussian Seismic Inversion (Rust + PyTorch)
 
 Physics-guided staged seismic velocity inversion and adaptive Delaunay Gaussian representation, powered by a cross-platform native **Rust (`PyO3` + `wgpu` + `rayon`)** core and **PyTorch (`mps` / `cuda`)** learning & attribution pipeline.
 
@@ -7,7 +7,7 @@ Physics-guided staged seismic velocity inversion and adaptive Delaunay Gaussian 
 ## Repository Structure
 
 ```text
-gaussian-lab/
+WGNet/
 ├── Cargo.toml                  # Rust workspace manifest
 ├── crates/
 │   ├── geology-core/           # Core 4th-order C-PML acoustic stencils, Ricker wavelet, and CPU reference solver
