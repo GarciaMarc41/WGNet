@@ -66,6 +66,7 @@ def main() -> None:
         setattr(args, k, saved[k])
     args.model = args.model or saved["model"]
     args.grad_checkpoint = False
+    args.dense_lowres = bool(saved.get("dense_lowres", False))
     device = get_device()
     data = OpenFWIData(args.root, args.train_per_family, args.val_per_family, args.test_per_family,
                        families=None if args.families == "all" else tuple(args.families.split(",")), seed=args.seed_data)

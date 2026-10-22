@@ -48,6 +48,7 @@ class WGNetConfig:
     head_channels: int = 128
     dropout: float = 0.0
     grad_checkpoint: bool = False  # recompute transformer blocks in backward (trades ~30% compute for memory)
+    dense_lowres: bool = False     # predict the dense field at 35x35 and upsample, so sharp structure must come from Gaussians
 
     @staticmethod
     def small() -> "WGNetConfig":
@@ -227,8 +228,12 @@ class WGNet(nn.Module):
 
         hc = cfg.head_channels
         self.up35 = nn.Sequential(nn.Conv2d(d, hc, 1), ConvBlock(hc), ConvBlock(hc))
-        self.up70 = nn.Sequential(nn.Conv2d(hc, hc // 2, 3, padding=1), nn.SiLU(), ConvBlock(hc // 2))
-        self.dense_head = nn.Conv2d(hc // 2, 1, 3, padding=1)
+        if cfg.dense_lowres:
+            self.up70 = None
+            self.dense_head = nn.Conv2d(hc, 1, 3, padding=1)
+        else:
+            self.up70 = nn.Sequential(nn.Conv2d(hc, hc // 2, 3, padding=1), nn.SiLU(), ConvBlock(hc // 2))
+            self.dense_head = nn.Conv2d(hc // 2, 1, 3, padding=1)
         self.gauss_head = nn.Sequential(nn.Conv2d(d, hc, 1), nn.SiLU(), nn.Conv2d(hc, N_GAUSS_PARAMS, 1))
         nn.init.normal_(self.dense_head.weight, std=1e-3)
         nn.init.zeros_(self.dense_head.bias)
@@ -296,9 +301,11 @@ class WGNet(nn.Module):
         feat35 = self.decoder_norm(q).transpose(1, 2).reshape(b, d, SLOT_SIDE, SLOT_SIDE)
 
         h = self.up35(feat35)
-        h = self.up70(F.interpolate(h, size=(GRID, GRID), mode="bilinear", align_corners=False))
-        dense = 3.0 + 2.0 * torch.tanh(self.dense_head(h) + self.base_atanh)
-        dense = dense.squeeze(1)
+        if self.up70 is None:
+            logit = F.interpolate(self.dense_head(h), size=(GRID, GRID), mode="bilinear", align_corners=False)
+        else:
+            logit = self.dense_head(self.up70(F.interpolate(h, size=(GRID, GRID), mode="bilinear", align_corners=False)))
+        dense = (3.0 + 2.0 * torch.tanh(logit + self.base_atanh)).squeeze(1)
 
         raw = self.gauss_head(feat35).flatten(2).transpose(1, 2)  # [B, 1225, 6]
         gaussians = activate_gaussians(raw)

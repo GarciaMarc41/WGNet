@@ -158,6 +158,7 @@ class EMA:
 def build_model(data: OpenFWIData, args, device: torch.device) -> WGNet:
     cfg = WGNetConfig.small() if args.model == "small" else WGNetConfig()
     cfg.grad_checkpoint = bool(getattr(args, "grad_checkpoint", False))
+    cfg.dense_lowres = bool(getattr(args, "dense_lowres", False))
     return WGNet(data.train_mean_km, data.rms_scale(), cfg).to(device)
 
 
@@ -301,6 +302,7 @@ def main() -> None:
     p.add_argument("--test-per-family", type=int, default=6000)
     p.add_argument("--model", choices=["base", "small"], default="base")
     p.add_argument("--grad-checkpoint", action="store_true", help="recompute transformer blocks in backward to save memory")
+    p.add_argument("--dense-lowres", action="store_true", help="dense head at 35x35 + bilinear upsample; sharp structure left to the Gaussians")
     p.add_argument("--stage", choices=["sup", "phys"], default="sup")
     p.add_argument("--out", default="results/base")
     p.add_argument("--init", default="", help="checkpoint to initialize from (phys stage)")
