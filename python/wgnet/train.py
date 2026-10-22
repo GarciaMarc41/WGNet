@@ -23,7 +23,8 @@ import torch
 import torch.nn.functional as F
 
 from .data import SHOTS, OpenFWIData, source_positions_m
-from .model import WGNet, WGNetConfig
+from .igm import InitialGaussianNetwork, macro_target
+from .model import WGNet, WGNetConfig, remap_legacy_state_dict
 from .physics import WavePhysics
 from .render import ACTIVE_AMP_KM, field_metrics
 
@@ -98,7 +99,9 @@ def sparsity_weight_at(step: int, args) -> float:
 
 @torch.no_grad()
 def evaluate(model: torch.nn.Module, waves: np.memmap, fields_km: np.ndarray, family_idx: np.ndarray, family_ids: list[str],
-             device: torch.device, batch: int, shots: int = 5, amp: bool = False) -> dict:
+             device: torch.device, batch: int, shots: int = 5, amp: bool = False, macro_sigma: float = 0.0) -> dict:
+    """Metrics against the raw truth, or, with `macro_sigma > 0`, against the low-passed macro model
+    (then `mae_raw_mps` additionally reports the error against the raw truth)."""
     model.eval()
     keep = torch.tensor(SHOT_SUBSETS[shots], device=device)
     src = torch.from_numpy(source_positions_m(SHOTS)).to(device).index_select(0, keep)
@@ -109,8 +112,11 @@ def evaluate(model: torch.nn.Module, waves: np.memmap, fields_km: np.ndarray, fa
         v = torch.from_numpy(fields_km[start : start + batch]).to(device)
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp):
             pred = model(w, src)
-        m = field_metrics(pred.field_km.float(), v)
-        m["dense_mae_mps"] = (pred.dense_km.float() - v).abs().mean(dim=(1, 2)) * 1000.0
+        v_target = macro_target(v, macro_sigma) if macro_sigma > 0 else v
+        m = field_metrics(pred.field_km.float(), v_target)
+        m["dense_mae_mps"] = (pred.dense_km.float() - v_target).abs().mean(dim=(1, 2)) * 1000.0
+        if macro_sigma > 0:
+            m["mae_raw_mps"] = (pred.field_km.float() - v).abs().mean(dim=(1, 2)) * 1000.0
         for k, val in m.items():
             acc.setdefault(k, []).append(val.cpu())
         n_active.append((pred.gaussians[..., 5].abs() >= ACTIVE_AMP_KM).sum(dim=1).float().cpu())
@@ -130,8 +136,9 @@ def evaluate(model: torch.nn.Module, waves: np.memmap, fields_km: np.ndarray, fa
 
 
 def format_eval(tag: str, res: dict) -> str:
+    raw = f" raw_MAE={res['mae_raw_mps']:.1f}" if "mae_raw_mps" in res else ""
     lines = [f"[{tag}] n={res['n']} MAE={res['mae_mps']:.1f} RMSE={res['rmse_mps']:.1f} SSIM={res['ssim']:.4f} "
-             f"(norm MAE={res['mae_norm']:.4f} MSE={res['mse_norm']:.5f}) dense_MAE={res['dense_mae_mps']:.1f} gaussians={res['active_gaussians']:.0f}"]
+             f"(norm MAE={res['mae_norm']:.4f} MSE={res['mse_norm']:.5f}) dense_MAE={res['dense_mae_mps']:.1f} gaussians={res['active_gaussians']:.0f}{raw}"]
     for fid, m in res["families"].items():
         lines.append(f"    {fid:14s} MAE={m['mae_mps']:7.1f} RMSE={m['rmse_mps']:7.1f} SSIM={m['ssim']:.4f}")
     return "\n".join(lines)
@@ -155,17 +162,27 @@ class EMA:
         model.load_state_dict({k: v.to(dtype=model.state_dict()[k].dtype) for k, v in self.shadow.items()})
 
 
-def build_model(data: OpenFWIData, args, device: torch.device) -> WGNet:
-    cfg = WGNetConfig.small() if args.model == "small" else WGNetConfig()
+def build_model(data: OpenFWIData, args, device: torch.device) -> torch.nn.Module:
+    cfg = WGNetConfig() if args.model == "base" else WGNetConfig.small()
     cfg.grad_checkpoint = bool(getattr(args, "grad_checkpoint", False))
     cfg.dense_lowres = bool(getattr(args, "dense_lowres", False))
+    if args.model == "igm":
+        nz, nx = (int(v) for v in args.igm_grid.lower().split("x"))
+        return InitialGaussianNetwork(data.train_mean_km, data.rms_scale(), cfg, grid=(nz, nx)).to(device)
     return WGNet(data.train_mean_km, data.rms_scale(), cfg).to(device)
 
 
-def load_checkpoint(path: Path, model: WGNet, device: torch.device, use_ema: bool = True) -> dict:
+def load_checkpoint(path: Path, model: torch.nn.Module, device: torch.device, use_ema: bool = True) -> dict:
     ckpt = torch.load(path, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt["ema"] if use_ema and "ema" in ckpt else ckpt["model"])
+    model.load_state_dict(remap_legacy_state_dict(ckpt["ema"] if use_ema and "ema" in ckpt else ckpt["model"]))
     return ckpt
+
+
+def macro_loss(pred, target_macro: torch.Tensor, args) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    err = pred.field_km - target_macro
+    l1 = err.abs().mean()
+    edge = 0.5 * ((err[:, :, 1:] - err[:, :, :-1]).abs().mean() + (err[:, 1:, :] - err[:, :-1, :]).abs().mean())
+    return l1 + args.edge_weight * edge, {"l1": l1.detach(), "edge": edge.detach()}
 
 
 def lr_at(step: int, args) -> float:
@@ -208,6 +225,7 @@ def train(args) -> None:
         step, best = int(ckpt["step"]), float(ckpt["best"])
         print(f"resumed {last} at step {step} (best val MAE {best:.2f})", flush=True)
 
+    macro_sigma = args.macro_sigma if args.model == "igm" else 0.0
     physics = WavePhysics() if args.stage == "phys" else None
     bands = parse_bands(args.bands) if physics else []
     rng = np.random.default_rng(args.seed + step)
@@ -230,7 +248,10 @@ def train(args) -> None:
         with torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=amp):
             pred = model(traces, src)
         pred = pred._replace(field_km=pred.field_km.float(), dense_km=pred.dense_km.float(), gaussians=pred.gaussians.float())
-        loss, parts = supervised_loss(pred, target, args, sparsity_weight_at(step, args))
+        if args.model == "igm":
+            loss, parts = macro_loss(pred, macro_target(target, args.macro_sigma), args)
+        else:
+            loss, parts = supervised_loss(pred, target, args, sparsity_weight_at(step, args))
 
         if physics is not None:
             band = bands[min(len(bands) - 1, int(len(bands) * (step - 1) / max(1, args.steps)))]
@@ -263,7 +284,7 @@ def train(args) -> None:
 
         if step % args.eval_every == 0 or step == args.steps:
             ema.apply_to(eval_model)
-            res = evaluate(eval_model, *val_subset, data.family_ids, device, args.eval_batch, amp=amp)
+            res = evaluate(eval_model, *val_subset, data.family_ids, device, args.eval_batch, amp=amp, macro_sigma=macro_sigma)
             res["step"] = step
             print(format_eval(f"val step {step}", res), flush=True)
             log.write(json.dumps({"eval": res}) + "\n")
@@ -286,7 +307,8 @@ def train(args) -> None:
 def run_test(model: WGNet, data: OpenFWIData, waves: dict, device: torch.device, args, out_dir: Path, amp: bool) -> None:
     report = {}
     for shots in [int(s) for s in args.eval_shots.split(",")]:
-        res = evaluate(model, waves["test"], data.fields_km["test"], data.family_idx["test"], data.family_ids, device, args.eval_batch, shots=shots, amp=amp)
+        res = evaluate(model, waves["test"], data.fields_km["test"], data.family_idx["test"], data.family_ids, device, args.eval_batch, shots=shots, amp=amp,
+                       macro_sigma=args.macro_sigma if args.model == "igm" else 0.0)
         print(format_eval(f"test {shots}-shot", res), flush=True)
         report[f"{shots}_shot"] = res
     with open(out_dir / "test_report.json", "w", encoding="utf-8") as f:
@@ -300,7 +322,10 @@ def main() -> None:
     p.add_argument("--train-per-family", type=int, default=23000)
     p.add_argument("--val-per-family", type=int, default=1000)
     p.add_argument("--test-per-family", type=int, default=6000)
-    p.add_argument("--model", choices=["base", "small"], default="base")
+    p.add_argument("--model", choices=["base", "small", "igm"], default="base",
+                   help="base/small: WGNet; igm: InitialGaussianNetwork (K Gaussians -> smooth macro model, small encoder)")
+    p.add_argument("--igm-grid", default="6x6", help="igm: anchor grid nz x nx (one Gaussian per anchor)")
+    p.add_argument("--macro-sigma", type=float, default=6.0, help="igm: Gaussian low-pass of the truth in cells that defines the macro-model target")
     p.add_argument("--grad-checkpoint", action="store_true", help="recompute transformer blocks in backward to save memory")
     p.add_argument("--dense-lowres", action="store_true", help="dense head at 35x35 + bilinear upsample; sharp structure left to the Gaussians")
     p.add_argument("--stage", choices=["sup", "phys"], default="sup")
@@ -337,9 +362,14 @@ def main() -> None:
         data = OpenFWIData(args.root, args.train_per_family, args.val_per_family, args.test_per_family,
                            families=None if args.families == "all" else tuple(args.families.split(",")), seed=args.seed_data)
         waves = data.ensure_wave_cache(("train", "val", "test") if args.eval_test else ("train", "val"))
+        saved = torch.load(Path(args.eval_only), map_location="cpu", weights_only=False)["args"]
+        for k in ("model", "igm_grid", "macro_sigma", "dense_lowres"):
+            if k in saved:
+                setattr(args, k, saved[k])
         model = build_model(data, args, device)
         load_checkpoint(Path(args.eval_only), model, device)
-        res = evaluate(model, waves["val"], data.fields_km["val"], data.family_idx["val"], data.family_ids, device, args.eval_batch, amp=device.type == "cuda")
+        res = evaluate(model, waves["val"], data.fields_km["val"], data.family_idx["val"], data.family_ids, device, args.eval_batch, amp=device.type == "cuda",
+                       macro_sigma=args.macro_sigma if args.model == "igm" else 0.0)
         print(format_eval("val", res), flush=True)
         if args.eval_test:
             run_test(model, data, waves, device, args, Path(args.eval_only).parent, device.type == "cuda")

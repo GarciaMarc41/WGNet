@@ -57,7 +57,7 @@ def main() -> None:
     p.add_argument("--split", default="val", choices=["val", "test"])
     p.add_argument("--ema", action="store_true", help="use the EMA weights instead of the live weights")
     p.add_argument("--root", default=str(Path(__file__).resolve().parents[2]))
-    p.add_argument("--model", choices=["base", "small"], default="")
+    p.add_argument("--model", choices=["base", "small", "igm"], default="")
     args = p.parse_args()
 
     ckpt = torch.load(args.ckpt, map_location="cpu", weights_only=False)
@@ -67,6 +67,8 @@ def main() -> None:
     args.model = args.model or saved["model"]
     args.grad_checkpoint = False
     args.dense_lowres = bool(saved.get("dense_lowres", False))
+    args.igm_grid = saved.get("igm_grid", "6x6")
+    args.macro_sigma = float(saved.get("macro_sigma", 6.0))
     device = get_device()
     data = OpenFWIData(args.root, args.train_per_family, args.val_per_family, args.test_per_family,
                        families=None if args.families == "all" else tuple(args.families.split(",")), seed=args.seed_data)

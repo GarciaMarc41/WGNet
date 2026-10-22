@@ -170,15 +170,21 @@ class TraveltimeBias(nn.Module):
         self.register_buffer("v_bank", torch.tensor(V_BANK_MPS), persistent=False)
         self._cache: dict[tuple, torch.Tensor] = {}
 
-    def forward(self, source_x_m: torch.Tensor) -> torch.Tensor:
-        key = (str(source_x_m.device), tuple(round(float(x), 3) for x in source_x_m.tolist()))
+    def forward(self, source_x_m: torch.Tensor, query_xz_m: torch.Tensor | None = None) -> torch.Tensor:
+        """`query_xz_m [Q, 2]` query points in meters; default: the 35x35 depth grid at cell centers."""
+        key = (str(source_x_m.device), tuple(round(float(x), 3) for x in source_x_m.tolist()),
+               None if query_xz_m is None else (query_xz_m.shape[0], round(float(query_xz_m.sum()), 2)))
         if key in self._cache:
             return self._cache[key]
         device = source_x_m.device
         m = min(len(V_BANK_MPS), self.heads)
-        qi = torch.arange(SLOT_SIDE, device=device, dtype=torch.float32)
-        qz, qx = torch.meshgrid(20.0 * qi + 10.0, 20.0 * qi + 10.0, indexing="ij")
-        qx, qz = qx.reshape(-1), qz.reshape(-1)  # [Q]
+        if query_xz_m is None:
+            qi = torch.arange(SLOT_SIDE, device=device, dtype=torch.float32)
+            qz, qx = torch.meshgrid(20.0 * qi + 10.0, 20.0 * qi + 10.0, indexing="ij")
+            qx, qz = qx.reshape(-1), qz.reshape(-1)  # [Q]
+        else:
+            qx, qz = query_xz_m[:, 0], query_xz_m[:, 1]
+        n_q = qx.shape[0]
         dz2 = (qz - STATION_DEPTH_M) ** 2
         t_tok = (torch.arange(TIME_TOKENS, device=device, dtype=torch.float32) * 4.0) * DEC_DT  # [T]
         x_rec = torch.arange(REC_TOKENS, device=device, dtype=torch.float32) * 20.0            # [R]
@@ -187,26 +193,26 @@ class TraveltimeBias(nn.Module):
         dist = d_src[:, :, None] + d_rec[:, None, :]                                            # [Q, S, R]
         tau = dist[None] / self.v_bank[:m].view(-1, 1, 1, 1) + RICKER_DELAY_S                   # [M, Q, S, R]
         diff = t_tok.view(1, 1, 1, -1, 1) - tau.unsqueeze(-2)                                   # [M, Q, S, T, R]
-        bias = torch.zeros(1, self.heads, N_SLOTS, diff.shape[2] * TIME_TOKENS * REC_TOKENS, device=device)
-        bias[0, :m] = -self.inv_two_sigma2 * diff.square().reshape(m, N_SLOTS, -1)
+        bias = torch.zeros(1, self.heads, n_q, diff.shape[2] * TIME_TOKENS * REC_TOKENS, device=device)
+        bias[0, :m] = -self.inv_two_sigma2 * diff.square().reshape(m, n_q, -1)
         if len(self._cache) > 64:
             self._cache.clear()
         self._cache[key] = bias
         return bias
 
 
-class WGNet(nn.Module):
-    def __init__(self, mean_km: np.ndarray | torch.Tensor, rms_scale: float, cfg: WGNetConfig | None = None) -> None:
+class GatherEncoder(nn.Module):
+    """Shot gathers -> tokens: physical channels, conv stem, Fourier positions, per-shot axial attention,
+    plus the traveltime bias used by whoever cross-attends to the tokens. Shared by WGNet and the
+    InitialGaussianNetwork."""
+
+    def __init__(self, rms_scale: float, cfg: WGNetConfig) -> None:
         super().__init__()
-        self.cfg = cfg = cfg or WGNetConfig()
+        self.cfg = cfg
         d = cfg.d_model
         self.rms_scale = float(rms_scale)
-
-        mean_t = torch.as_tensor(np.asarray(mean_km), dtype=torch.float32).view(1, 1, GRID, GRID)
-        self.register_buffer("base_atanh", torch.atanh(torch.clamp((mean_t - 3.0) * 0.5, -0.999, 0.999)))
         t_norm = torch.linspace(0.0, 1.0, DEC_SAMPLES).view(1, 1, DEC_SAMPLES, 1)
         self.register_buffer("tgc_gain", ((t_norm + 0.05) / 0.12).pow(1.4), persistent=False)
-
         self.stem = nn.Sequential(
             nn.Conv2d(3, 64, (5, 3), stride=(2, 1), padding=(2, 1)), nn.SiLU(),
             nn.Conv2d(64, 128, (5, 3), stride=(2, 2), padding=(2, 1)), nn.SiLU(),
@@ -217,10 +223,72 @@ class WGNet(nn.Module):
             [AxialBlock(d, cfg.n_heads, cfg.mlp_ratio, cfg.dropout) for _ in range(cfg.gather_layers)]
         )
         self.gather_norm = nn.LayerNorm(d)
+        self.bias = TraveltimeBias(cfg.n_heads)
+
+    def preprocess(self, traces: torch.Tensor) -> torch.Tensor:
+        """`[B, S, T, 70]` recordings at 0.5 ms (T=2001) or 4 ms (T=251) -> `[B*S, 3, 251, 70]` channels."""
+        if traces.shape[2] != DEC_SAMPLES:
+            step = (traces.shape[2] - 1) // (DEC_SAMPLES - 1)
+            traces = traces[:, :, ::step, :][:, :, :DEC_SAMPLES, :]
+        b, s = traces.shape[:2]
+        x = traces.reshape(b * s, 1, DEC_SAMPLES, GRID)
+        ch0 = torch.asinh(x / self.rms_scale)
+        ch1 = torch.asinh(x * self.tgc_gain / (0.12 * self.rms_scale))
+        ch2 = torch.asinh(F.pad(x[:, :, 1:] - x[:, :, :-1], (0, 0, 1, 0)) / (0.25 * self.rms_scale))
+        return torch.cat([ch0, ch1, ch2], dim=1)
+
+    @staticmethod
+    def token_positions(source_x_m: torch.Tensor) -> torch.Tensor:
+        """`[S, T, R, 60]` Fourier features of (t, x_r, x_s, offset, midpoint), all scaled to about [-1, 1]."""
+        device = source_x_m.device
+        t = (torch.arange(TIME_TOKENS, device=device, dtype=torch.float32) * 4.0 * DEC_DT) * 2.0 - 1.0
+        xr = torch.arange(REC_TOKENS, device=device, dtype=torch.float32) * 20.0 / XMAX_M * 2.0 - 1.0
+        xs = source_x_m / XMAX_M * 2.0 - 1.0
+        s, tt, rr = len(xs), TIME_TOKENS, REC_TOKENS
+        coords = torch.stack(
+            [
+                t.view(1, tt, 1).expand(s, tt, rr),
+                xr.view(1, 1, rr).expand(s, tt, rr),
+                xs.view(s, 1, 1).expand(s, tt, rr),
+                (xr.view(1, 1, rr) - xs.view(s, 1, 1)).expand(s, tt, rr) * 0.5,
+                (xr.view(1, 1, rr) + xs.view(s, 1, 1)).expand(s, tt, rr) * 0.5,
+            ],
+            dim=-1,
+        )
+        return fourier_features(coords)
+
+    @staticmethod
+    def default_sources(traces: torch.Tensor, source_x_m: torch.Tensor | None) -> torch.Tensor:
+        s, device = traces.shape[1], traces.device
+        if source_x_m is None:
+            source_x_m = torch.linspace(0.0, XMAX_M, s, device=device) if s > 1 else torch.tensor([XMAX_M / 2], device=device)
+        return source_x_m.to(device=device, dtype=torch.float32)
+
+    def forward(self, traces: torch.Tensor, source_x_m: torch.Tensor) -> torch.Tensor:
+        """`[B, S, T, 70]` recordings -> `[B, S*63*35, d]` gather tokens."""
+        b, s = traces.shape[:2]
+        feat = self.stem(self.preprocess(traces))  # [B*S, d, 63, 35]
+        d = feat.shape[1]
+        tok = feat.permute(0, 2, 3, 1).reshape(b, s, TIME_TOKENS, REC_TOKENS, d)
+        tok = tok + self.token_pos(self.token_positions(source_x_m)).unsqueeze(0)
+        tok = tok.reshape(b * s, TIME_TOKENS, REC_TOKENS, d)
+        ckpt = self.cfg.grad_checkpoint and self.training and torch.is_grad_enabled()
+        for blk in self.gather_blocks:
+            tok = checkpoint(blk, tok, use_reentrant=False) if ckpt else blk(tok)
+        return self.gather_norm(tok).reshape(b, s * TIME_TOKENS * REC_TOKENS, d)
+
+
+class WGNet(nn.Module):
+    def __init__(self, mean_km: np.ndarray | torch.Tensor, rms_scale: float, cfg: WGNetConfig | None = None) -> None:
+        super().__init__()
+        self.cfg = cfg = cfg or WGNetConfig()
+        d = cfg.d_model
+        self.encoder = GatherEncoder(rms_scale, cfg)
+        mean_t = torch.as_tensor(np.asarray(mean_km), dtype=torch.float32).view(1, 1, GRID, GRID)
+        self.register_buffer("base_atanh", torch.atanh(torch.clamp((mean_t - 3.0) * 0.5, -0.999, 0.999)))
 
         self.query_embed = nn.Parameter(torch.randn(N_SLOTS, d) * 0.02)
         self.query_pos = nn.Linear(2 * 12, d)
-        self.bias = TraveltimeBias(cfg.n_heads)
         self.decoder_blocks = nn.ModuleList(
             [DecoderBlock(d, cfg.n_heads, cfg.mlp_ratio, cfg.dropout) for _ in range(cfg.decoder_layers)]
         )
@@ -240,62 +308,25 @@ class WGNet(nn.Module):
         nn.init.normal_(self.gauss_head[-1].weight, std=1e-3)
         nn.init.zeros_(self.gauss_head[-1].bias)
 
-    # ------------------------------------------------------------------------------------------
-    def preprocess(self, traces: torch.Tensor) -> torch.Tensor:
-        """`[B, S, T, 70]` recordings at 0.5 ms (T=2001) or 4 ms (T=251) -> `[B*S, 3, 251, 70]` channels."""
-        if traces.shape[2] != DEC_SAMPLES:
-            step = (traces.shape[2] - 1) // (DEC_SAMPLES - 1)
-            traces = traces[:, :, ::step, :][:, :, :DEC_SAMPLES, :]
-        b, s = traces.shape[:2]
-        x = traces.reshape(b * s, 1, DEC_SAMPLES, GRID)
-        ch0 = torch.asinh(x / self.rms_scale)
-        ch1 = torch.asinh(x * self.tgc_gain / (0.12 * self.rms_scale))
-        ch2 = torch.asinh(F.pad(x[:, :, 1:] - x[:, :, :-1], (0, 0, 1, 0)) / (0.25 * self.rms_scale))
-        return torch.cat([ch0, ch1, ch2], dim=1)
-
-    def token_positions(self, source_x_m: torch.Tensor) -> torch.Tensor:
-        """`[S, T, R, 60]` Fourier features of (t, x_r, x_s, offset, midpoint), all scaled to about [-1, 1]."""
-        device = source_x_m.device
-        t = (torch.arange(TIME_TOKENS, device=device, dtype=torch.float32) * 4.0 * DEC_DT) * 2.0 - 1.0
-        xr = torch.arange(REC_TOKENS, device=device, dtype=torch.float32) * 20.0 / XMAX_M * 2.0 - 1.0
-        xs = source_x_m / XMAX_M * 2.0 - 1.0
-        s, tt, rr = len(xs), TIME_TOKENS, REC_TOKENS
-        coords = torch.stack(
-            [
-                t.view(1, tt, 1).expand(s, tt, rr),
-                xr.view(1, 1, rr).expand(s, tt, rr),
-                xs.view(s, 1, 1).expand(s, tt, rr),
-                (xr.view(1, 1, rr) - xs.view(s, 1, 1)).expand(s, tt, rr) * 0.5,
-                (xr.view(1, 1, rr) + xs.view(s, 1, 1)).expand(s, tt, rr) * 0.5,
-            ],
-            dim=-1,
-        )
-        return fourier_features(coords)
+    @property
+    def rms_scale(self) -> float:
+        return self.encoder.rms_scale
 
     def forward(self, traces: torch.Tensor, source_x_m: torch.Tensor | None = None) -> Prediction:
         if traces.ndim == 3:
             traces = traces.unsqueeze(0)
-        b, s = traces.shape[:2]
+        b = traces.shape[0]
         device = traces.device
-        if source_x_m is None:
-            source_x_m = torch.linspace(0.0, XMAX_M, s, device=device) if s > 1 else torch.tensor([XMAX_M / 2], device=device)
-        source_x_m = source_x_m.to(device=device, dtype=torch.float32)
-
-        feat = self.stem(self.preprocess(traces))  # [B*S, d, 63, 35]
-        d = feat.shape[1]
-        tok = feat.permute(0, 2, 3, 1).reshape(b, s, TIME_TOKENS, REC_TOKENS, d)
-        tok = tok + self.token_pos(self.token_positions(source_x_m)).unsqueeze(0)
-        tok = tok.reshape(b * s, TIME_TOKENS, REC_TOKENS, d)
+        source_x_m = self.encoder.default_sources(traces, source_x_m)
+        ctx = self.encoder(traces, source_x_m)
+        d = ctx.shape[-1]
         ckpt = self.cfg.grad_checkpoint and self.training and torch.is_grad_enabled()
-        for blk in self.gather_blocks:
-            tok = checkpoint(blk, tok, use_reentrant=False) if ckpt else blk(tok)
-        ctx = self.gather_norm(tok).reshape(b, s * TIME_TOKENS * REC_TOKENS, d)
 
         qi = torch.arange(SLOT_SIDE, device=device, dtype=torch.float32) / (SLOT_SIDE - 1) * 2.0 - 1.0
         qz, qx = torch.meshgrid(qi, qi, indexing="ij")
         q = self.query_embed + self.query_pos(fourier_features(torch.stack([qx.reshape(-1), qz.reshape(-1)], -1)))
         q = q.unsqueeze(0).expand(b, -1, -1)
-        bias = self.bias(source_x_m).to(ctx.dtype)
+        bias = self.encoder.bias(source_x_m).to(ctx.dtype)
         for blk in self.decoder_blocks:
             q = checkpoint(blk, q, ctx, bias, use_reentrant=False) if ckpt else blk(q, ctx, bias)
         feat35 = self.decoder_norm(q).transpose(1, 2).reshape(b, d, SLOT_SIDE, SLOT_SIDE)
@@ -311,3 +342,13 @@ class WGNet(nn.Module):
         gaussians = activate_gaussians(raw)
         residual = render_residual(gaussians)
         return Prediction(dense + residual, dense, residual, gaussians, feat35)
+
+
+LEGACY_PREFIXES = ("stem.", "token_pos.", "gather_blocks.", "gather_norm.", "bias.")
+
+
+def remap_legacy_state_dict(state: dict) -> dict:
+    """Checkpoints saved before the GatherEncoder split keep their encoder weights at the top level."""
+    if any(k.startswith("encoder.") for k in state):
+        return state
+    return {("encoder." + k if k.startswith(LEGACY_PREFIXES) else k): v for k, v in state.items()}
