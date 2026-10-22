@@ -268,12 +268,12 @@ def train(args) -> None:
             print(format_eval(f"val step {step}", res), flush=True)
             log.write(json.dumps({"eval": res}) + "\n")
             log.flush()
+            is_best = res["mae_mps"] < best
+            best = min(best, res["mae_mps"])
             state = {"model": model.state_dict(), "ema": ema.shadow, "optimizer": opt.state_dict(), "step": step,
                      "best": best, "args": vars(args), "cfg": vars(model.cfg), "val": res}
             torch.save(state, last)
-            if res["mae_mps"] < best:
-                best = res["mae_mps"]
-                state["best"] = best
+            if is_best:
                 torch.save(state, out_dir / "best.pt")
                 print(f"  new best val MAE {best:.2f} m/s", flush=True)
 
